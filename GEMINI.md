@@ -58,4 +58,33 @@ The script should save the recovered data into two files:
 - Add print statements to show progress (e.g., "Found 5 potential records...").
 - **Double Check**: Ensure specific logic to handle the ")]}'" prefix often found in Google XHR responses.
 
-Please provide the complete, ready-to-run Python code.
+# Technical Findings & Protocol Analysis
+
+Through forensic analysis of the HAR data, the following protocol details have been established:
+
+## 1. Google Batchexecute Protocol
+The core data resides in `application/json` responses, wrapped in a specific format:
+-   **XSSI Prefix**: Responses start with `)]}'` (plus optional whitespace/newlines) to prevent Cross-Site Scripting Inclusion.
+-   **Length Indicator**: This prefix is often followed by a number (length of the payload) and a newline.
+-   **Streaming JSON**: The actual body often contains multiple concatenated JSON objects. The parser must handle `Extra data` errors by reading one object at a time (`decoder.raw_decode`).
+-   **Nested Serialization**: The payload is typically a JSON list `[["wrb.fr", "rpcid", "STRING"]]`, where the third element is a **stringified** JSON array containing the actual business data. This requires a double-parse approach.
+
+## 2. Protobuf-over-JSON Structure
+The internal data structure is a JSON mapping of Google Protobuf messages. It is schemaless (no keys, only indices).
+-   **Record Structure**: A large array representing a single event.
+    -   **Index 4**: Timestamp (Microseconds since epoch).
+    -   **Index 5 & 6**: Base64-like strings (e.g., `AODP...`). Analysis confirms these are **Protobuf messages** containing a constant User/App ID and a variable Message ID. They do **not** contain a Conversation ID.
+    -   **Index 9**: The User Prompt structure: `["Prompt Text", true, "Prompted"]`. The string `"Prompted"` is a reliable signature.
+    -   **Index 34**: The Model Response structure. Contains nested lists eventually holding an HTML string of the response.
+
+## 3. Session & ID Analysis
+-   **Conversation ID**: **Absent**. Detailed analysis of the metadata (URL parameters, Protobuf IDs) revealed no stable identifier that groups messages into conversations across different time points. `f.sid` in the URL is a Browser Session ID that remains constant over days.
+-   **Grouping Strategy**: Since explicit IDs are missing, **Time-based Clustering** is the only viable method to restore logical sessions. A gap of **2 hours** between messages is a proven heuristic to delimit distinct conversation sessions.
+
+## 4. Recovery Logic
+1.  **Iterate** all HAR entries.
+2.  **Decode** `batchexecute` JSON streams.
+3.  **Recursive Scan** for the `["Prompt", true, "Prompted"]` signature.
+4.  **Extract** Prompt, Timestamp, and Response (HTML converted to Markdown).
+5.  **Cluster** records into sessions based on time gaps (e.g., >2 hours).
+6.  **Output** structured files per session.

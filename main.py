@@ -14,7 +14,7 @@ from markdownify import markdownify as md
 
 HAR_FILE = 'myactivity.google.com.har'
 OUTPUT_JSON_FILE = 'recovered_gemini.json'
-OUTPUT_MD_FILE = 'recovered_gemini.md'
+OUTPUT_DIR = 'recovered_sessions'
 
 def strip_json_prefix(text):
     """Strips the common Google JSON prefix `)]}'` and length indicator from a string."""
@@ -22,7 +22,7 @@ def strip_json_prefix(text):
         text = text[4:]
 
     text = text.strip()
-    match = re.search(r'^[0-9]+\s*([\[\{])', text)
+    match = re.search(r'^[0-9]+\s*([["{])', text)
     if match:
         return text[match.start(1):]
     return text
@@ -95,8 +95,9 @@ def process_inner_payload(payload_json, recovered_records, metadata):
                 "response": md(response_html).strip() if response_html else None,
                 "metadata": metadata
             }
-            # Deduplication key: date + prompt
-            unique_key = (record['date'], record['prompt'])
+            # Capture IDs (just strings, no decoding needed for recovery)
+            if len(payload_json) > 5: record['id_a'] = str(payload_json[5])
+            if len(payload_json) > 6: record['id_b'] = str(payload_json[6])
 
             # Efficient deduplication check
             is_duplicate = False
@@ -204,38 +205,90 @@ def parse_har_file(har_file_path):
     print(f"Finished processing. Total unique records found: {len(recovered_records)}")
     return recovered_records
 
-def save_to_json(records, output_file):
-    """Saves records to a JSON file."""
+def analyze_sessions(records):
+    # Time Clustering
+    records.sort(key=lambda x: x['date'])
+
+    sessions = []
+    current_session = []
+    last_ts = 0
+    TIME_THRESHOLD_SEC = 2 * 60 * 60 # 2 hours
+
+    for r in records:
+        ts = datetime.fromisoformat(r['date']).timestamp()
+        if last_ts == 0 or (ts - last_ts) > TIME_THRESHOLD_SEC:
+            if current_session: sessions.append(current_session)
+            current_session = [r]
+        else:
+            current_session.append(r)
+        last_ts = ts
+    if current_session: sessions.append(current_session)
+
+    return sessions
+
+def save_to_json(sessions, output_file):
+    """Saves grouped sessions to a JSON file."""
+    output_data = []
+    for i, session in enumerate(sessions):
+        if not session: continue
+        session_data = {
+            "session_id": f"guessed_session_{i+1}",
+            "start_time": session[0]['date'],
+            "message_count": len(session),
+            "messages": session
+        }
+        output_data.append(session_data)
+
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(records, f, ensure_ascii=False, indent=4)
+        json.dump(output_data, f, ensure_ascii=False, indent=4)
     print(f"Recovered data saved to '{output_file}'")
 
-def save_to_markdown(records, output_file):
-    """Saves records to a Markdown file, grouped by date."""
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for record in records:
-            date_obj = datetime.fromisoformat(record['date'])
-            f.write(f"### [{date_obj.strftime('%Y-%m-%d %H:%M')}]\n\n")
+def save_sessions_to_files(sessions, output_dir):
+    """Saves each session to a separate Markdown file."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-            # User Prompt
-            clean_prompt = record['prompt'].replace('\r', '')
-            quoted_prompt = "\n".join([f"> {line}" for line in clean_prompt.split('\n')])
-            f.write(f"**User**:\n{quoted_prompt}\n\n")
+    print(f"Saving {len(sessions)} sessions to directory '{output_dir}/'...")
 
-            # Gemini Response
-            if record.get('response'):
-                clean_response = record['response'].replace('\r', '')
-                f.write(f"**Gemini**:\n{clean_response}\n\n")
+    for i, session in enumerate(sessions):
+        if not session: continue
 
-            f.write("---\n\n")
+        # Get start time for filename
+        start_dt = datetime.fromisoformat(session[0]['date'])
+        filename = f"Session_{start_dt.strftime('%Y%m%d_%H%M')}.md"
+        file_path = os.path.join(output_dir, filename)
 
-    print(f"Recovered data saved to '{output_file}'")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"# Session {i+1}\n")
+            f.write(f"**Date:** {start_dt.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Messages:** {len(session)}\n\n")
+
+            for record in session:
+                date_obj = datetime.fromisoformat(record['date'])
+                # Use complete time format as requested
+                f.write(f"## [{date_obj.strftime('%Y-%m-%d %H:%M:%S')}]\n\n")
+
+                # User Prompt
+                clean_prompt = record['prompt'].replace('\r', '')
+                quoted_prompt = "\n".join([f"> {line}" for line in clean_prompt.split('\n')])
+                f.write(f"**User**:\n{quoted_prompt}\n\n")
+
+                # Gemini Response
+                if record.get('response'):
+                    clean_response = record['response'].replace('\r', '')
+                    f.write(f"**Gemini**:\n{clean_response}\n\n")
+
+                f.write("---\n\n")
+
+    print("All sessions saved.")
 
 def main():
     recovered_data = parse_har_file(HAR_FILE)
     if recovered_data:
-        save_to_json(recovered_data, OUTPUT_JSON_FILE)
-        save_to_markdown(recovered_data, OUTPUT_MD_FILE)
+        sessions = analyze_sessions(recovered_data)
+        print(f"Grouped into {len(sessions)} sessions based on 2h gaps.")
+        save_to_json(sessions, OUTPUT_JSON_FILE)
+        save_sessions_to_files(sessions, OUTPUT_DIR)
     else:
         print("No Gemini chat records found.")
 
