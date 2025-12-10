@@ -2,22 +2,33 @@
 # uv init
 # uv add beautifulsoup4
 # uv add markdownify
+# uv pip install ruff
 
 import json
 import base64
-
 from datetime import datetime
-from bs4 import BeautifulSoup
 import os
+import re
 
 HAR_FILE = 'myactivity.google.com.har'
 OUTPUT_JSON_FILE = 'recovered_gemini.json'
 OUTPUT_MD_FILE = 'recovered_gemini.md'
 
 def strip_json_prefix(text):
-    """Strips the common Google JSON prefix `)]}'` from a string."""
+    """Strips the common Google JSON prefix `)]}'` and length indicator from a string."""
     if text.startswith(")]}'"):
-        return text[4:]
+        text = text[4:]
+    
+    text = text.strip()
+    
+    # Check for and remove potential length prefix (digits followed by JSON start)
+    # The length is usually followed by a newline, then the JSON content.
+    # We look for the first '[' or '{' to ensure we capture the JSON start.
+    match = re.search(r'^[0-9]+\s*([\[\{])', text)
+    if match:
+        # If we found a number followed by [ or {, start from the [ or {
+        return text[match.start(1):]
+        
     return text
 
 def decode_har_entry_content(content):
@@ -25,62 +36,92 @@ def decode_har_entry_content(content):
     if content.get('encoding') == 'base64' and content.get('text'):
         try:
             return base64.b64decode(content['text']).decode('utf-8', errors='ignore')
-        except Exception as e:
-            print(f"Error decoding base64 content: {e}")
+        except Exception:
             return None
     return content.get('text')
 
-def find_gemini_data_in_json(data):
+def extract_timestamp(record_list):
     """
-    Recursively searches for Gemini chat data within a JSON structure.
-    Looks for patterns indicative of user prompts and timestamps.
+    Scans a record list for a likely timestamp (microseconds).
+    Heuristic: Integer > 1,600,000,000,000,000 (Year 2020+ in microseconds).
     """
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key == "query_text" and isinstance(value, str):
-                # Found a potential prompt
-                return value
-            if key == "query" and isinstance(value, str):
-                return value
-            result = find_gemini_data_in_json(value)
-            if result:
-                return result
-    elif isinstance(data, list):
-        for item in data:
-            result = find_gemini_data_in_json(item)
-            if result:
-                return result
+    for item in record_list:
+        if isinstance(item, int):
+            # Check for microseconds (16 digits)
+            if item > 1_600_000_000_000_000:
+                return datetime.fromtimestamp(item / 1_000_000)
+            # Fallback check for milliseconds (13 digits) - less likely for Google internal but possible
+            elif item > 1_600_000_000_000:
+                return datetime.fromtimestamp(item / 1_000)
     return None
 
-def find_timestamp_in_json(data):
+def extract_prompt(record_list):
     """
-    Recursively searches for a timestamp within a JSON structure.
-    Assumes timestamp is an integer representing milliseconds or microseconds since epoch.
+    Scans a record list for the user prompt.
+    Heuristic: A sub-list [ "Prompt Text", true, "Prompted" ].
     """
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key in ["timestamp", "time_usec", "query_timestamp"] and isinstance(value, (int, str)):
-                try:
-                    # Attempt to convert to int, handle potential string timestamps
-                    ts = int(value)
-                    # Heuristic: If it's a very large number, it's likely microseconds, convert to milliseconds
-                    if ts > 999999999999: # More than 13 digits, likely microseconds
-                        return datetime.fromtimestamp(ts / 1_000_000)
-                    elif ts > 999999999: # More than 10 digits, likely milliseconds
-                        return datetime.fromtimestamp(ts / 1_000)
-                    else: # Assume seconds
-                        return datetime.fromtimestamp(ts)
-                except ValueError:
-                    pass # Not a valid integer timestamp
-            result = find_timestamp_in_json(value)
-            if result:
-                return result
-    elif isinstance(data, list):
-        for item in data:
-            result = find_timestamp_in_json(item)
-            if result:
-                return result
+    for item in record_list:
+        if isinstance(item, list) and len(item) >= 3:
+            # Check for the specific signature ["Text", boolean, "Prompted"]
+            if item[2] == "Prompted" and isinstance(item[0], str):
+                return item[0]
     return None
+
+def process_inner_payload(payload_json, recovered_records):
+    """
+    Traverses the inner decoded JSON payload to find chat records.
+    The payload is typically a list of lists.
+    """
+    if not isinstance(payload_json, list):
+        return
+
+    # The payload structure is complex. We iterate through everything looking for records.
+    # A "record" usually is a list that contains a timestamp and a "Prompted" sub-list.
+    
+    # We can try to iterate recursively or just iterate the top-level items if they represent conversation nodes.
+    # Based on debug output, the payload is a list of records.
+    
+    for item in payload_json:
+        if isinstance(item, list):
+            # This 'item' could be a chat record.
+            prompt = extract_prompt(item)
+            if prompt:
+                timestamp = extract_timestamp(item)
+                if timestamp:
+                    record = {
+                        "date": timestamp.isoformat(),
+                        "prompt": prompt.strip()
+                    }
+                    # Simple deduplication
+                    if record not in recovered_records:
+                        recovered_records.append(record)
+                else:
+                    # Found prompt but no timestamp? Capture it anyway with a fallback or omit?
+                    # Better to capture.
+                    pass 
+
+            # Recursion: The structure might be nested.
+            process_inner_payload(item, recovered_records)
+
+def scan_for_nested_data(data, recovered_records):
+    """
+    Recursively scans JSON data for strings that look like nested JSON arrays.
+    """
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                # Check if it looks like a JSON array start
+                if item.startswith('[[') and item.endswith(']'):
+                    try:
+                        inner_json = json.loads(item)
+                        process_inner_payload(inner_json, recovered_records)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            else:
+                scan_for_nested_data(item, recovered_records)
+    elif isinstance(data, dict):
+        for value in data.values():
+            scan_for_nested_data(value, recovered_records)
 
 def parse_har_file(har_file_path):
     """Parses the HAR file to extract Gemini chat records."""
@@ -101,92 +142,54 @@ def parse_har_file(har_file_path):
     print(f"Found {len(entries)} HAR entries. Processing...")
 
     for i, entry in enumerate(entries):
-        request = entry.get('request', {})
-        response = entry.get('response', {})
-        content = response.get('content', {})
-
-        url = request.get('url', '')
+        content = entry.get('response', {}).get('content', {})
         mime_type = content.get('mimeType', '')
         text_content = decode_har_entry_content(content)
 
         if not text_content:
             continue
 
-        prompt = None
-        timestamp = None
+        # Heuristic: Only process JSON responses, specifically from batchexecute or similar
+        # But scanning all JSONs is safer.
+        if 'application/json' in mime_type or 'text/javascript' in mime_type: # sometimes it's text/javascript with )]}'
+            stripped_text = strip_json_prefix(text_content)
+            if not stripped_text:
+                continue
 
-        # Heuristic 1: Check request URL for Gemini indicators
-        if "gemini" in url.lower() or "bard" in url.lower():
-            # Try to find prompt and timestamp in request POST data
-            post_data_text = request.get('postData', {}).get('text')
-            if post_data_text:
+            decoder = json.JSONDecoder()
+            pos = 0
+            while pos < len(stripped_text):
                 try:
-                    post_data_json = json.loads(strip_json_prefix(post_data_text))
-                    prompt = find_gemini_data_in_json(post_data_json)
-                    timestamp = find_timestamp_in_json(post_data_json)
+                    # Skip leading whitespace which raw_decode doesn't always handle if explicitly passed start index? 
+                    # Actually raw_decode handles whitespace before the object, but we loops.
+                    # We should manually skip whitespace to be safe or rely on raw_decode.
+                    # raw_decode reads *one* object.
+                    
+                    # Manually skip whitespace to detect end of string
+                    while pos < len(stripped_text) and stripped_text[pos].isspace():
+                        pos += 1
+                    
+                    if pos >= len(stripped_text):
+                        break
+
+                    json_data, index = decoder.raw_decode(stripped_text, pos)
+                    pos = index
+                    
+                    scan_for_nested_data(json_data, recovered_records)
+                    
                 except json.JSONDecodeError:
-                    pass # Not JSON
+                    # If we fail to decode a chunk, we might as well stop for this entry
+                    # print(f"JSON Decode Error in entry {i} at pos {pos}")
+                    break
 
-        # Heuristic 2: Process JSON responses
-        if mime_type == 'application/json' or 'json' in mime_type:
-            try:
-                json_data = json.loads(strip_json_prefix(text_content))
-
-                # Look for "Gemini" keyword to filter relevant JSON blobs
-                if "Gemini" in json.dumps(json_data): # Check if "Gemini" is anywhere in the JSON
-                    current_prompt = find_gemini_data_in_json(json_data)
-                    current_timestamp = find_timestamp_in_json(json_data)
-                    if current_prompt and current_timestamp:
-                        prompt = current_prompt
-                        timestamp = current_timestamp
-                        # If we found it, no need to search further in this entry
-                        print(f"Found potential Gemini JSON record in entry {i+1}: '{prompt[:50]}...'" )
-
-            except json.JSONDecodeError:
-                pass # Not JSON, or malformed JSON
-
-        # Heuristic 3: Process HTML responses (e.g., myactivity page itself)
-        elif 'text/html' in mime_type:
-            # Look for structured data within HTML, e.g., script tags with JSON-LD or embedded JS variables
-            soup = BeautifulSoup(text_content, 'html.parser')
-            for script in soup.find_all('script', type='application/json'):
-                try:
-                    script_json = json.loads(strip_json_prefix(script.string))
-                    if "Gemini" in json.dumps(script_json):
-                        current_prompt = find_gemini_data_in_json(script_json)
-                        current_timestamp = find_timestamp_in_json(script_json)
-                        if current_prompt and current_timestamp:
-                            prompt = current_prompt
-                            timestamp = current_timestamp
-                            print(f"Found potential Gemini HTML script record in entry {i+1}: '{prompt[:50]}...'" )
-                            break # Found in script, move to next entry
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # Also search for specific elements that might contain activity details
-            # This is highly dependent on My Activity page structure and might change
-            # As a general search, we can look for div/span elements with relevant text
-            # This is less reliable due to dynamic IDs/classes, so prioritize JSON/script tags
-            if not prompt: # If not found yet, try searching more broadly in HTML
-                for elem in soup.find_all(lambda tag: tag.name in ['div', 'span', 'p']):
-                    if elem.string and ("Gemini" in elem.string or "Bard" in elem.string):
-                        # This is very broad, need a better heuristic for prompts in HTML
-                        # For now, if "Gemini" is in text, consider it for further inspection if other methods fail
-                        pass
-
-        if prompt and timestamp:
-            # Basic deduplication based on prompt and date might be needed if multiple heuristics hit the same data
-            record = {
-                "date": timestamp.isoformat(),
-                "prompt": prompt.strip()
-            }
-            if record not in recovered_records: # Simple deduplication
-                recovered_records.append(record)
         
-        if (i + 1) % 100 == 0:
-            print(f"Processed {i + 1}/{len(entries)} entries. Found {len(recovered_records)} potential records.")
+        if (i + 1) % 20 == 0:
+            print(f"Processed {i + 1}/{len(entries)} entries. Found {len(recovered_records)} records so far.")
 
-    print(f"Finished processing HAR entries. Total potential records found: {len(recovered_records)}")
+    # Sort records by date
+    recovered_records.sort(key=lambda x: x['date'])
+    
+    print(f"Finished processing. Total unique records found: {len(recovered_records)}")
     return recovered_records
 
 def save_to_json(records, output_file):
@@ -202,8 +205,11 @@ def save_to_markdown(records, output_file):
             date_obj = datetime.fromisoformat(record['date'])
             f.write(f"### [{date_obj.strftime('%Y-%m-%d %H:%M')}]\n\n")
             # Basic markdown sanitation for prompts
-            clean_prompt = record['prompt'].replace('\n', ' ').replace('\r', ' ')
-            f.write(f"> {clean_prompt}\n\n")
+            clean_prompt = record['prompt'].replace('\r', '') # Keep newlines in prompts, they are valuable
+            
+            # Blockquote the prompt
+            quoted_prompt = "\n".join([f"> {line}" for line in clean_prompt.split('\n')])
+            f.write(f"{quoted_prompt}\n\n")
     print(f"Recovered data saved to '{output_file}'")
 
 def main():
