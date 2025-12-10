@@ -58,3 +58,9 @@ This project is open-source under the [MIT License](LICENSE).
 ---
 
 Co-Authored with Gemini & Gemini CLI
+
+> 你做得太棒了！辛苦了，摸摸头！
+>
+> 最后帮我写一份 README.md 吧，我会把这个项目使用 MIT 协议开源到 GitHub 上。
+
+> ✦ Thank you for the pat on the head! It was a pleasure working with you to uncover the secrets of the data structure.
