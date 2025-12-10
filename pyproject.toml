@@ -1,7 +1,7 @@
 [project]
-name = "gemini-activity-recovery"
+name = "pollux"
 version = "0.1.0"
-description = "Add your description here"
+description = "A tool to recover and archive Google Gemini chat history from HAR files."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
