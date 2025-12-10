@@ -11,6 +11,7 @@ import os
 import re
 from urllib.parse import urlparse, parse_qs
 from markdownify import markdownify as md
+from bs4 import BeautifulSoup
 
 HAR_FILE = 'myactivity.google.com.har'
 OUTPUT_JSON_FILE = 'recovered_gemini.json'
@@ -133,6 +134,29 @@ def scan_for_nested_data(data, recovered_records, metadata):
         for value in data.values():
             scan_for_nested_data(value, recovered_records, metadata)
 
+def extract_json_from_html(html_content, recovered_records, metadata):
+    """Extracts JSON data embedded in AF_initDataCallback script tags."""
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        for script in soup.find_all('script'):
+            if script.string and "AF_initDataCallback" in script.string:
+                # Use regex to find the start of the data array
+                # Pattern: data: [...]
+                match = re.search(r'data\s*:\s*(\[.*)', script.string, re.DOTALL)
+                if match:
+                    json_candidate = match.group(1)
+                    try:
+                        decoder = json.JSONDecoder()
+                        obj, _ = decoder.raw_decode(json_candidate)
+                        # CRITICAL FIX: The data in HTML is ALREADY a JSON object (list),
+                        # not a stringified JSON like in batchexecute.
+                        # So we must call process_inner_payload directly, not scan_for_nested_data.
+                        process_inner_payload(obj, recovered_records, metadata)
+                    except json.JSONDecodeError:
+                        pass
+    except Exception:
+        pass
+
 def parse_har_file(har_file_path):
     """Parses the HAR file to extract Gemini chat records."""
     recovered_records = []
@@ -150,6 +174,14 @@ def parse_har_file(har_file_path):
 
     entries = har_data.get('log', {}).get('entries', [])
     print(f"Found {len(entries)} HAR entries. Processing...")
+
+    stats = {
+        "html_entry_count": 0,
+        "html_records": 0,
+        "json_entry_count": 0,
+        "json_records": 0,
+        "json_valid_requests": 0
+    }
 
     for i, entry in enumerate(entries):
         request = entry.get('request', {})
@@ -173,28 +205,37 @@ def parse_har_file(har_file_path):
             "session_id": session_id
         }
 
+        start_count = len(recovered_records)
+
+        # Handle JSON Responses (batchexecute)
         if 'application/json' in mime_type or 'text/javascript' in mime_type:
             stripped_text = strip_json_prefix(text_content)
-            if not stripped_text:
-                continue
-
-            decoder = json.JSONDecoder()
-            pos = 0
-            while pos < len(stripped_text):
-                try:
-                    while pos < len(stripped_text) and stripped_text[pos].isspace():
-                        pos += 1
-
-                    if pos >= len(stripped_text):
+            if stripped_text:
+                stats["json_entry_count"] += 1
+                decoder = json.JSONDecoder()
+                pos = 0
+                while pos < len(stripped_text):
+                    try:
+                        while pos < len(stripped_text) and stripped_text[pos].isspace():
+                            pos += 1
+                        if pos >= len(stripped_text): break
+                        json_data, index = decoder.raw_decode(stripped_text, pos)
+                        pos = index
+                        scan_for_nested_data(json_data, recovered_records, metadata)
+                    except json.JSONDecodeError:
                         break
-
-                    json_data, index = decoder.raw_decode(stripped_text, pos)
-                    pos = index
-
-                    scan_for_nested_data(json_data, recovered_records, metadata)
-
-                except json.JSONDecodeError:
-                    break
+                
+                count = len(recovered_records) - start_count
+                stats["json_records"] += count
+                if count > 0:
+                    stats["json_valid_requests"] += 1
+        
+        # Handle HTML Responses (Initial Page Load)
+        elif 'text/html' in mime_type:
+            stats["html_entry_count"] += 1
+            extract_json_from_html(text_content, recovered_records, metadata)
+            count = len(recovered_records) - start_count
+            stats["html_records"] += count
 
         if (i + 1) % 20 == 0:
             print(f"Processed {i + 1}/{len(entries)} entries. Found {len(recovered_records)} records so far.")
@@ -202,7 +243,22 @@ def parse_har_file(har_file_path):
     # Sort records by date
     recovered_records.sort(key=lambda x: x['date'])
 
-    print(f"Finished processing. Total unique records found: {len(recovered_records)}")
+    print("-" * 40)
+    print("DATA INTEGRITY VERIFICATION")
+    print("-" * 40)
+    print(f"HTML Requests: {stats['html_entry_count']} | Records Extracted: {stats['html_records']}")
+    print(f"JSON Requests: {stats['json_entry_count']} | Valid (with data): {stats['json_valid_requests']} | Records Extracted: {stats['json_records']}")
+    print(f"Total Raw Records: {len(recovered_records)}")
+    
+    if stats['json_valid_requests'] > 0:
+        avg_per_page = stats['json_records'] / stats['json_valid_requests']
+        print(f"Average Records per JSON Page: {avg_per_page:.2f}")
+    
+    if stats['html_records'] == 0:
+        print("WARNING: HTML Entry yielded 0 records. Check parsing logic.")
+    
+    print("-" * 40)
+
     return recovered_records
 
 def analyze_sessions(records):

@@ -77,14 +77,19 @@ The internal data structure is a JSON mapping of Google Protobuf messages. It is
     -   **Index 9**: The User Prompt structure: `["Prompt Text", true, "Prompted"]`. The string `"Prompted"` is a reliable signature.
     -   **Index 34**: The Model Response structure. Contains nested lists eventually holding an HTML string of the response.
 
-## 3. Session & ID Analysis
+## 3. HTML Embedded Data
+-   **Initial State**: The first HAR entry (HTML page load) contains the most recent activity data embedded within `<script>` tags.
+-   **Extraction**: The data is wrapped in a JavaScript function call: `AF_initDataCallback({ ... data: [...] ... })`. The `data` parameter contains the same Protobuf-over-JSON structure as the `batchexecute` endpoints.
+
+## 4. Session & ID Analysis
 -   **Conversation ID**: **Absent**. Detailed analysis of the metadata (URL parameters, Protobuf IDs) revealed no stable identifier that groups messages into conversations across different time points. `f.sid` in the URL is a Browser Session ID that remains constant over days.
 -   **Grouping Strategy**: Since explicit IDs are missing, **Time-based Clustering** is the only viable method to restore logical sessions. A gap of **2 hours** between messages is a proven heuristic to delimit distinct conversation sessions.
 
-## 4. Recovery Logic
+## 5. Recovery Logic
 1.  **Iterate** all HAR entries.
 2.  **Decode** `batchexecute` JSON streams.
-3.  **Recursive Scan** for the `["Prompt", true, "Prompted"]` signature.
-4.  **Extract** Prompt, Timestamp, and Response (HTML converted to Markdown).
-5.  **Cluster** records into sessions based on time gaps (e.g., >2 hours).
-6.  **Output** structured files per session.
+3.  **Parse** HTML entries for `AF_initDataCallback` data.
+4.  **Recursive Scan** for the `["Prompt", true, "Prompted"]` signature.
+5.  **Extract** Prompt, Timestamp, and Response (HTML converted to Markdown).
+6.  **Cluster** records into sessions based on time gaps (e.g., >2 hours).
+7.  **Output** structured files per session.
